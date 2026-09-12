@@ -21,6 +21,7 @@
 #define DEFAULT_BITS_PER_SAMPLE 16
 #define DEFAULT_FRAME_SIZE      352
 #define DECRYPT_BUFFER_SIZE     8192
+#define SEEK_ANCHOR_REUSE_US    500000
 
 static const char *TAG = "audio_recv";
 
@@ -41,6 +42,21 @@ static void audio_receiver_reset_resend_state(void) {
 static void audio_receiver_reset_blocks(void) {
   receiver.blocks_read = 0;
   receiver.blocks_read_in_sequence = 0;
+}
+
+static void audio_receiver_arm_seek_gates(uint32_t rtp_time,
+                                          uint32_t gate_window) {
+  receiver.discard_before_rtp = rtp_time;
+  receiver.discard_before_rtp_valid = true;
+  receiver.discard_above_rtp = rtp_time + gate_window;
+  receiver.discard_above_rtp_valid = true;
+}
+
+static void audio_receiver_reset_seek_counters(void) {
+  receiver.seek_epoch++;
+  receiver.post_seek_decoded_frames = 0;
+  receiver.post_seek_read_frames = 0;
+  audio_output_mark_seek(receiver.seek_epoch);
 }
 
 static void audio_receiver_copy_stream_state(audio_stream_t *dst,
@@ -206,6 +222,8 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
   // left in the TCP socket buffer after a backward seek.
   const uint32_t gate_window = (uint32_t)(10 * sample_rate);
   const int32_t seek_threshold = 5 * sample_rate;
+  uint32_t old_anchor = receiver.timing.anchor_rtp_time;
+  bool old_anchor_valid = receiver.timing.anchor_valid;
 
   // --- Phase 1: Arm RTP gates BEFORE opening the blanket gate -----------
   //
@@ -220,10 +238,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
   // already empty when the flush happened (forward-seek).
   if (receiver.arm_gate_on_next_anchor) {
     receiver.arm_gate_on_next_anchor = false;
-    receiver.discard_before_rtp = rtp_time;
-    receiver.discard_before_rtp_valid = true;
-    receiver.discard_above_rtp = rtp_time + gate_window;
-    receiver.discard_above_rtp_valid = true;
+    audio_receiver_arm_seek_gates(rtp_time, gate_window);
     gates_armed = true;
     ESP_LOGI(TAG,
              "RTP gates armed on anchor: discard_before=%lu discard_above=%lu",
@@ -301,10 +316,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
       receiver.timing.deferred_flush_pending = false;
       audio_timing_reset_continuity(&receiver.timing);
       receiver.blocks_read_in_sequence = 0;
-      receiver.discard_before_rtp = rtp_time;
-      receiver.discard_before_rtp_valid = true;
-      receiver.discard_above_rtp = rtp_time + gate_window;
-      receiver.discard_above_rtp_valid = true;
+      audio_receiver_arm_seek_gates(rtp_time, gate_window);
       receiver.timing.quick_start = true;
       gates_armed = true;
     } else {
@@ -344,10 +356,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
       receiver.blocks_read_in_sequence = 0;
       receiver.timing.quick_start = true;
       if (!gates_armed) {
-        receiver.discard_before_rtp = rtp_time;
-        receiver.discard_before_rtp_valid = true;
-        receiver.discard_above_rtp = rtp_time + gate_window;
-        receiver.discard_above_rtp_valid = true;
+        audio_receiver_arm_seek_gates(rtp_time, gate_window);
       }
     }
   }
@@ -364,6 +373,19 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
 
   audio_timing_set_anchor(&receiver.timing, &receiver.stream->format, clock_id,
                           network_time_ns, rtp_time);
+  receiver.last_anchor_rtp = rtp_time;
+  receiver.last_anchor_clock_id = clock_id;
+  receiver.last_anchor_network_time_ns = network_time_ns;
+  receiver.last_anchor_time_us = esp_timer_get_time();
+  ESP_LOGI(TAG,
+           "Seek state anchor: epoch=%" PRIu32 " old_valid=%d old_rtp=%" PRIu32
+           " new_rtp=%" PRIu32 " playing=%d paused_snapshot=%d buffered=%d "
+           "blanket_gate=%d gates=%d/%d",
+           receiver.seek_epoch, old_anchor_valid, old_anchor, rtp_time,
+           receiver.timing.playing, receiver.paused_rtp_valid,
+           audio_buffer_get_frame_count(&receiver.buffer),
+           receiver.discard_all_until_anchor,
+           receiver.discard_before_rtp_valid, receiver.discard_above_rtp_valid);
 }
 
 void audio_receiver_set_playing(bool playing) {
@@ -579,8 +601,20 @@ size_t audio_receiver_read(int16_t *buffer, size_t samples) {
     return 0;
   }
 
-  return audio_timing_read(&receiver.timing, &receiver.buffer, receiver.stream,
-                           &receiver.stats, buffer, samples);
+  size_t frames = audio_timing_read(&receiver.timing, &receiver.buffer,
+                                    receiver.stream, &receiver.stats, buffer,
+                                    samples);
+  if (receiver.seek_epoch != 0 && frames > 0 &&
+      receiver.post_seek_read_frames < 3) {
+    receiver.post_seek_read_frames++;
+    ESP_LOGI(TAG,
+             "Seek receiver read: epoch=%" PRIu32 " read_frames=%zu "
+             "post_seek_reads=%" PRIu32 " buffered=%d playing=%d",
+             receiver.seek_epoch, frames, receiver.post_seek_read_frames,
+             audio_buffer_get_frame_count(&receiver.buffer),
+             receiver.timing.playing);
+  }
+  return frames;
 }
 
 bool audio_receiver_has_data(void) {
@@ -610,17 +644,49 @@ void audio_receiver_seek_flush(void) {
   // audio_receiver_flush() but sets timing.quick_start so audio_timing_read
   // starts as soon as 1 frame is available, with normal anchor-based timing.
   // Also disarms any pending deferred flush (audio_timing_reset clears it).
+  int sample_rate = receiver.stream ? receiver.stream->format.sample_rate
+                                    : DEFAULT_SAMPLE_RATE;
+  if (sample_rate <= 0) {
+    sample_rate = DEFAULT_SAMPLE_RATE;
+  }
+  uint32_t gate_window = (uint32_t)(10 * sample_rate);
+  int64_t now_us = esp_timer_get_time();
+  bool reuse_anchor =
+      receiver.timing.anchor_valid && receiver.last_anchor_time_us > 0 &&
+      now_us - receiver.last_anchor_time_us <= SEEK_ANCHOR_REUSE_US;
+  uint32_t reuse_rtp = receiver.last_anchor_rtp;
+  uint64_t reuse_clock_id = receiver.last_anchor_clock_id;
+  uint64_t reuse_network_time_ns = receiver.last_anchor_network_time_ns;
+  int buffered_before = audio_buffer_get_frame_count(&receiver.buffer);
+
+  audio_receiver_reset_seek_counters();
+  audio_decoder_reset(receiver.decoder);
   audio_receiver_flush();
   receiver.timing.quick_start = true;
-  // Request that the RTP gate be armed as soon as the next anchor arrives.
-  // This covers the forward-seek case where the buffer is already empty by
-  // the time SETRATEANCHORTIME arrives, so the seek-detection heuristic
-  // (which needs oldest_rtp from the buffer) would otherwise miss arming it.
-  receiver.arm_gate_on_next_anchor = true;
-  // Reject ALL incoming frames until the next anchor.  Prevents stale TCP
-  // data from filling the buffer between FLUSHBUFFERED and SETRATEANCHORTIME,
-  // which would cause a second flush and double the startup delay.
-  receiver.discard_all_until_anchor = true;
+  if (reuse_anchor) {
+    audio_timing_set_anchor(&receiver.timing, &receiver.stream->format,
+                            reuse_clock_id, reuse_network_time_ns, reuse_rtp);
+    audio_receiver_arm_seek_gates(reuse_rtp, gate_window);
+    receiver.arm_gate_on_next_anchor = false;
+    receiver.discard_all_until_anchor = false;
+  } else {
+    // Request that the RTP gate be armed as soon as the next anchor arrives.
+    // This covers the forward-seek case where the buffer is already empty by
+    // the time SETRATEANCHORTIME arrives, so the seek-detection heuristic
+    // (which needs oldest_rtp from the buffer) would otherwise miss arming it.
+    receiver.arm_gate_on_next_anchor = true;
+    // Reject ALL incoming frames until the next anchor.  Prevents stale TCP
+    // data from filling the buffer between FLUSHBUFFERED and SETRATEANCHORTIME,
+    // which would cause a second flush and double the startup delay.
+    receiver.discard_all_until_anchor = true;
+  }
+  ESP_LOGI(TAG,
+           "Seek flush: epoch=%" PRIu32 " buffered_before=%d "
+           "reuse_recent_anchor=%d anchor_rtp=%" PRIu32 " playing=%d "
+           "blanket_gate=%d gates=%d/%d",
+           receiver.seek_epoch, buffered_before, reuse_anchor, reuse_rtp,
+           receiver.timing.playing, receiver.discard_all_until_anchor,
+           receiver.discard_before_rtp_valid, receiver.discard_above_rtp_valid);
 }
 
 void audio_receiver_set_deferred_flush(uint32_t flush_until_ts) {

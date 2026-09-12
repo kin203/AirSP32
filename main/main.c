@@ -34,8 +34,10 @@
 
 #include "iot_board.h"
 #include "esp_heap_caps.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -207,7 +209,17 @@ static void on_airplay_client_event(rtsp_event_t event,
 #endif
 
 void app_main(void) {
+  const esp_app_desc_t *app_desc = esp_app_get_description();
   ESP_LOGW(TAG, "Boot: reset reason %d", (int)esp_reset_reason());
+  ESP_LOGI(TAG, "Firmware: AirSPlay32 %s", app_desc->version);
+  ESP_LOGI(TAG,
+           "Boot diagnostics: task_wdt=%s stack_hwm=%u free_internal=%lu "
+           "free_psram=%lu",
+           esp_task_wdt_status(NULL) == ESP_OK ? "subscribed"
+                                               : "not_subscribed",
+           (unsigned)uxTaskGetStackHighWaterMark(NULL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   // Initialize NVS
   esp_err_t ret = nvs_flash_init();

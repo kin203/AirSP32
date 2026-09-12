@@ -5,8 +5,10 @@
 #include "audio_timing.h"
 
 #include "audio_output.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "ntp_clock.h"
 #include "ptp_clock.h"
 
@@ -89,6 +91,7 @@
 // realistic depth will never hit it, short enough to detect a genuinely stuck
 // or invalid anchor in a few seconds.
 #define MAX_CONSECUTIVE_EARLY 50
+#define LARGE_GAP_MS          500
 
 static const char *TAG = "audio_time";
 // consecutive_early_frames is now a field in audio_timing_t so it resets
@@ -263,7 +266,12 @@ void audio_timing_reset_continuity(audio_timing_t *timing) {
   if (!timing) {
     return;
   }
+  timing->timeline_generation++;
   timing->expected_rtp_valid = false;
+  timing->last_gap_log_us = 0;
+  timing->gaps_suppressed = 0;
+  timing->late_drop_count = 0;
+  timing->late_drop_active = false;
   timing->pos_err_filtered_us = 0;
   timing->servo_engaged = false;
   timing->servo_phase = 0;
@@ -352,12 +360,17 @@ void audio_timing_set_anchor(audio_timing_t *timing,
   (void)clock_id;
 
   int64_t now_ns = (int64_t)esp_timer_get_time() * 1000LL;
+  bool old_anchor_valid = timing->anchor_valid;
+  uint32_t old_anchor_rtp = timing->anchor_rtp_time;
 
   timing->anchor_rtp_time = rtp_time;
   timing->anchor_network_time_ns = network_time_ns;
   timing->anchor_local_time_ns = now_ns;
   timing->ptp_locked = ptp_clock_is_locked();
   timing->anchor_valid = true;
+  // A fresh sender anchor may represent a seek or a new RTP timeline. Do not
+  // compare post-anchor frames against the previous timeline's expected RTP.
+  audio_timing_reset_continuity(timing);
   // Reset frame counters so pre-buffered audio after a pause/resume or
   // track skip does not accumulate into the new anchor's counts.
   timing->consecutive_early_frames = 0;
@@ -371,8 +384,10 @@ void audio_timing_set_anchor(audio_timing_t *timing,
                     1000000LL;
   ESP_LOGI(
       TAG,
-      "Anchor set: rtp=%" PRIu32 " lead=%lld ms ptp_locked=%d quick_start=%d",
-      rtp_time, (long long)lead_ms, timing->ptp_locked, timing->quick_start);
+      "Anchor set: old_valid=%d old_rtp=%" PRIu32 " new_rtp=%" PRIu32
+      " lead=%lld ms ptp_locked=%d quick_start=%d timeline=%" PRIu32,
+      old_anchor_valid, old_anchor_rtp, rtp_time, (long long)lead_ms,
+      timing->ptp_locked, timing->quick_start, timing->timeline_generation);
 }
 
 void audio_timing_set_playing(audio_timing_t *timing, bool playing) {
@@ -622,6 +637,25 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         timing->expected_rtp_valid) {
       int32_t cont_delta = (int32_t)(hdr->rtp_timestamp - timing->expected_rtp);
       if (cont_delta > 0) {
+        int32_t large_gap_samples =
+            (int32_t)(((int64_t)LARGE_GAP_MS * format->sample_rate) / 1000);
+        if (cont_delta > large_gap_samples) {
+          ESP_LOGW(TAG,
+                   "RTP timeline discontinuity: old_expected_rtp=%" PRIu32
+                   " incoming_rtp=%" PRIu32 " signed_delta=%" PRId32
+                   " anchor_rtp=%" PRIu32 " timeline=%" PRIu32
+                   " playing=%d stack_hwm=%u heap=%lu psram=%lu wdt=%s",
+                   timing->expected_rtp, hdr->rtp_timestamp, cont_delta,
+                   timing->anchor_rtp_time, timing->timeline_generation,
+                   timing->playing,
+                   (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                   (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                   esp_task_wdt_status(NULL) == ESP_OK ? "subscribed"
+                                                       : "not_subscribed");
+          audio_timing_reset_continuity(timing);
+          gap = false;
+        } else {
         gap = true;
         timing->gaps++;
         // Rate-limited: a burst of separate holes must not throttle this
@@ -639,6 +673,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
           timing->gaps_suppressed = 0;
         } else {
           timing->gaps_suppressed++;
+        }
         }
       }
     }
@@ -705,7 +740,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
             // (confirms the counter only counts real buffer reads, not
             // pending re-checks).
             if (timing->consecutive_early_frames == 1) {
-              ESP_LOGI(TAG,
+              ESP_LOGD(TAG,
                        "First early frame: rtp=%" PRIu32 " early=%.1f ms"
                        " quick_start=%d buffered=%d",
                        hdr->rtp_timestamp, (float)early_us / 1000.0f,

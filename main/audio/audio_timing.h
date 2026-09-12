@@ -53,6 +53,7 @@ typedef struct {
   // with a deep stale buffer into seconds of stalled audio.
   int64_t last_gap_log_us;
   uint32_t gaps_suppressed;
+  uint32_t timeline_generation;
   // Position servo state (see POS_SERVO_* in audio_timing.c).
   // pos_err_filtered_us: IIR-smoothed playout position error.
   // servo_engaged/servo_phase: hysteresis state and trim rate divider.

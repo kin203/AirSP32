@@ -52,6 +52,11 @@ void audio_output_start(void);
 void audio_output_flush(void);
 
 /**
+ * Mark a seek boundary for rate-limited output diagnostics.
+ */
+void audio_output_mark_seek(uint32_t epoch);
+
+/**
  * Stop the AirPlay playback task (for yielding I2S to another source)
  */
 void audio_output_stop(void);

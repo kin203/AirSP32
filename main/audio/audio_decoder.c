@@ -177,6 +177,37 @@ void audio_decoder_destroy(audio_decoder_t *decoder) {
   free(decoder);
 }
 
+void audio_decoder_reset(audio_decoder_t *decoder) {
+  if (!decoder) {
+    return;
+  }
+
+  if (decoder->kind == AUDIO_DECODER_AAC) {
+    aac_decoder_reset(decoder);
+    return;
+  }
+
+  if (decoder->kind == AUDIO_DECODER_ALAC) {
+    if (decoder->alac_decoder) {
+      esp_alac_dec_close(decoder->alac_decoder);
+      decoder->alac_decoder = NULL;
+    }
+
+    esp_alac_dec_cfg_t alac_cfg = {.codec_spec_info =
+                                       decoder->alac_magic_cookie,
+                                   .spec_info_len = ALAC_MAGIC_COOKIE_SIZE};
+    esp_audio_err_t err =
+        esp_alac_dec_open(&alac_cfg, sizeof(alac_cfg), &decoder->alac_decoder);
+    if (err != ESP_AUDIO_ERR_OK) {
+      ESP_LOGE(TAG, "ALAC decoder reset failed: %d", err);
+      decoder->alac_decoder = NULL;
+      decoder->kind = AUDIO_DECODER_NONE;
+    } else {
+      ESP_LOGW(TAG, "ALAC decoder reset OK");
+    }
+  }
+}
+
 int audio_decoder_decode(audio_decoder_t *decoder, const uint8_t *input,
                          size_t input_len, int16_t *output,
                          size_t output_capacity_samples,

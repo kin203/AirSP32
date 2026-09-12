@@ -95,6 +95,14 @@ typedef struct {
   // Cleared on flush/reset and consumed after one use.
   uint32_t paused_rtp;
   bool paused_rtp_valid;
+
+  uint32_t last_anchor_rtp;
+  uint64_t last_anchor_clock_id;
+  uint64_t last_anchor_network_time_ns;
+  int64_t last_anchor_time_us;
+  uint32_t seek_epoch;
+  uint32_t post_seek_decoded_frames;
+  uint32_t post_seek_read_frames;
 } audio_receiver_state_t;
 
 // Lightweight RTP gate used by the buffered TCP task before decrypt/decode.

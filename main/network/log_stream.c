@@ -12,11 +12,14 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include <stdarg.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -27,6 +30,7 @@
 #define BROADCAST_TASK_STACK  4096
 #define BROADCAST_INTERVAL_MS 100
 #define MAX_SEND_CHUNK        1024
+#define LOG_DIAG_INTERVAL_US  5000000LL
 
 static char *s_ring;
 static volatile size_t s_head; /* next write position  */
@@ -36,6 +40,10 @@ static SemaphoreHandle_t s_mutex;
 static httpd_handle_t s_server;
 
 static vprintf_like_t s_orig_vprintf;
+static TaskHandle_t s_broadcast_task;
+static volatile uint32_t s_dropped_logs;
+static volatile uint32_t s_ws_send_failures;
+static int64_t s_last_diag_us;
 
 /* ------------------------------------------------------------------ */
 /*  Ring buffer helpers (protected by s_mutex)                         */
@@ -68,28 +76,63 @@ static size_t ring_read(char *buf, size_t max) {
   return avail;
 }
 
+static void log_stream_diag(const char *event) {
+  int64_t now = esp_timer_get_time();
+  if ((now - s_last_diag_us) < LOG_DIAG_INTERVAL_US) {
+    return;
+  }
+  s_last_diag_us = now;
+
+  size_t used = 0;
+  if (s_mutex && xSemaphoreTake(s_mutex, 0) == pdTRUE) {
+    used = ring_used();
+    xSemaphoreGive(s_mutex);
+  }
+
+  ESP_LOGI("log_stream",
+           "diag event=%s ring_used=%u dropped=%" PRIu32
+           " ws_send_fail=%" PRIu32
+           " log_ws_stack_hwm=%u free_internal=%lu largest_internal=%lu "
+           "free_psram=%lu min_heap=%lu tasks=%u",
+           event, (unsigned)used, s_dropped_logs, s_ws_send_failures,
+           s_broadcast_task ? (unsigned)uxTaskGetStackHighWaterMark(s_broadcast_task)
+                            : 0U,
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned long)esp_get_minimum_free_heap_size(),
+           (unsigned)uxTaskGetNumberOfTasks());
+}
+
 /* ------------------------------------------------------------------ */
 /*  Log hook — called from any task/ISR-safe context by esp_log       */
 /* ------------------------------------------------------------------ */
 
 static int log_vprintf_hook(const char *fmt, va_list args) {
+  va_list uart_args;
+  va_list ring_args;
+  va_copy(uart_args, args);
+  va_copy(ring_args, args);
+
   /* Always print to UART first. */
-  int ret = s_orig_vprintf(fmt, args);
+  int ret =
+      s_orig_vprintf ? s_orig_vprintf(fmt, uart_args) : vprintf(fmt, uart_args);
+  va_end(uart_args);
 
   /* Format into a stack buffer and push to ring. */
   char buf[256];
-  va_list copy;
-  va_copy(copy, args);
-  int len = vsnprintf(buf, sizeof(buf), fmt, copy);
-  va_end(copy);
+  int len = vsnprintf(buf, sizeof(buf), fmt, ring_args);
+  va_end(ring_args);
 
   if (len > 0) {
     if ((size_t)len >= sizeof(buf)) {
       len = sizeof(buf) - 1;
     }
-    if (xSemaphoreTake(s_mutex, 0) == pdTRUE) {
+    if (s_mutex && s_ring && xSemaphoreTake(s_mutex, 0) == pdTRUE) {
       ring_write(buf, (size_t)len);
       xSemaphoreGive(s_mutex);
+    } else {
+      s_dropped_logs++;
     }
     /* If the mutex is held we silently drop — better than blocking a log call.
      */
@@ -106,6 +149,7 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
    * IDF build the handshake GET may or may not reach here.  Return OK for it
    * and do nothing — clients are tracked by the broadcast task, not here. */
   if (req->method == HTTP_GET) {
+    log_stream_diag("ws_open");
     return ESP_OK;
   }
 
@@ -118,6 +162,7 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
    * of returning them (which httpd logs as "uri handler execution failed"). */
   httpd_ws_frame_t frame = {0};
   if (httpd_ws_recv_frame(req, &frame, 0) != ESP_OK) {
+    log_stream_diag("ws_recv_error");
     return ESP_OK;
   }
   if (frame.len > 0) {
@@ -127,6 +172,7 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
       httpd_ws_recv_frame(req, &frame, sizeof(buf));
     }
   }
+  log_stream_diag("ws_frame");
   return ESP_OK;
 }
 
@@ -180,12 +226,10 @@ static void broadcast_task(void *arg) {
     for (size_t i = 0; i < ws_count; i++) {
       esp_err_t err = httpd_ws_send_frame_async(s_server, ws_fds[i], &frame);
       if (err != ESP_OK) {
-        /* Session is closing; httpd cleans it up and it will no longer
-         * be listed on the next tick. */
-        ESP_LOGD("log_stream", "WS send to fd=%d failed: %s", ws_fds[i],
-                 esp_err_to_name(err));
+        s_ws_send_failures++;
       }
     }
+    log_stream_diag("ws_send");
   }
 }
 
@@ -234,7 +278,7 @@ esp_err_t log_stream_register(httpd_handle_t server) {
   }
 
   task_create_spiram(broadcast_task, "log_ws", BROADCAST_TASK_STACK, NULL, 3,
-                     NULL, NULL);
+                     &s_broadcast_task, NULL);
   ESP_LOGI("log_stream", "Log streaming on /ws/logs");
   return ESP_OK;
 }

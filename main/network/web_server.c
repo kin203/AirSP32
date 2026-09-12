@@ -20,6 +20,7 @@
 #include "log_stream.h"
 #include "rtsp_server.h"
 #include "audio_output.h"
+#include "eq.h"
 #include "esp_app_desc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -990,11 +991,7 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
                           reset_reason_str(esp_reset_reason()));
   cJSON_AddNumberToObject(info, "uptime_s",
                           (double)(esp_timer_get_time() / 1000000));
-#ifdef CONFIG_DAC_TAS58XX
   cJSON_AddBoolToObject(info, "eq_supported", true);
-#else
-  cJSON_AddBoolToObject(info, "eq_supported", false);
-#endif
 #ifdef DAC_HAS_SUB_OFFSET
   cJSON_AddBoolToObject(info, "sub_supported", dac_has_sub());
 #else
@@ -1197,33 +1194,46 @@ static esp_err_t fs_list_handler(httpd_req_t *req) {
 }
 
 /* ================================================================== */
-/*  EQ Page + API  (only when TAS58xx DAC is configured)               */
+/*  Software 5-band EQ Page + API                                      */
 /* ================================================================== */
-
-#ifdef CONFIG_DAC_TAS58XX
 
 static esp_err_t eq_page_handler(httpd_req_t *req) {
   return serve_spiffs_file(req, "/spiffs/www/eq.html", "text/html");
 }
 
+static void eq_add_state(cJSON *json) {
+  cJSON_AddNumberToObject(json, "mode", eq_get_preset());
+  cJSON_AddStringToObject(json, "mode_name",
+                          eq_get_preset_name(eq_get_preset()));
+  cJSON_AddNumberToObject(json, "bands", EQ_BAND_COUNT);
+  cJSON_AddNumberToObject(json, "min_db", EQ_GAIN_MIN_DB);
+  cJSON_AddNumberToObject(json, "max_db", EQ_GAIN_MAX_DB);
+  cJSON_AddNumberToObject(json, "step_db", EQ_GAIN_STEP_DB);
+  cJSON_AddNumberToObject(json, "preamp_db", eq_get_preamp_db());
+  cJSON_AddBoolToObject(json, "custom_dirty", eq_is_custom_dirty());
+
+  cJSON *freqs = cJSON_CreateArray();
+  cJSON *gains = cJSON_CreateArray();
+  for (size_t i = 0; i < EQ_BAND_COUNT; i++) {
+    cJSON_AddItemToArray(freqs, cJSON_CreateNumber(eq_get_band_hz(i)));
+    cJSON_AddItemToArray(gains, cJSON_CreateNumber(eq_get_band(i)));
+  }
+  cJSON_AddItemToObject(json, "freqs", freqs);
+  cJSON_AddItemToObject(json, "gains", gains);
+
+  cJSON *presets = cJSON_CreateArray();
+  for (int i = 0; i < EQ_PRESET_COUNT; i++) {
+    cJSON *preset = cJSON_CreateObject();
+    cJSON_AddNumberToObject(preset, "id", i);
+    cJSON_AddStringToObject(preset, "name", eq_get_preset_name(i));
+    cJSON_AddItemToArray(presets, preset);
+  }
+  cJSON_AddItemToObject(json, "presets", presets);
+}
+
 static esp_err_t eq_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
-  cJSON *arr = cJSON_CreateArray();
-
-  float gains[SETTINGS_EQ_BANDS];
-  if (settings_get_eq_gains(gains) == ESP_OK) {
-    for (int i = 0; i < SETTINGS_EQ_BANDS; i++) {
-      cJSON_AddItemToArray(arr, cJSON_CreateNumber((double)gains[i]));
-    }
-  } else {
-    /* No saved EQ — return all zeros (flat) */
-    for (int i = 0; i < SETTINGS_EQ_BANDS; i++) {
-      cJSON_AddItemToArray(arr, cJSON_CreateNumber(0.0));
-    }
-  }
-
-  cJSON_AddItemToObject(json, "gains", arr);
-  cJSON_AddNumberToObject(json, "bands", SETTINGS_EQ_BANDS);
+  eq_add_state(json);
   cJSON_AddBoolToObject(json, "success", true);
 
   char *json_str = cJSON_Print(json);
@@ -1235,49 +1245,45 @@ static esp_err_t eq_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t eq_post_handler(httpd_req_t *req) {
-  char content[512];
-  int ret = httpd_req_recv(req, content, sizeof(content) - 1);
-  if (ret <= 0) {
-    httpd_resp_send_500(req);
+  char *content = recv_body(req, 512);
+  if (!content) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
     return ESP_FAIL;
   }
-  content[ret] = '\0';
 
   cJSON *json = cJSON_Parse(content);
+  free(content);
   if (!json) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     return ESP_FAIL;
   }
 
   cJSON *response = cJSON_CreateObject();
-  cJSON *gains_arr = cJSON_GetObjectItem(json, "gains");
+  esp_err_t err = ESP_ERR_INVALID_ARG;
+  cJSON *mode = cJSON_GetObjectItem(json, "mode");
+  cJSON *band = cJSON_GetObjectItem(json, "band");
+  cJSON *gain = cJSON_GetObjectItem(json, "gain");
+  cJSON *save = cJSON_GetObjectItem(json, "save_custom");
 
-  if (gains_arr && cJSON_IsArray(gains_arr) &&
-      cJSON_GetArraySize(gains_arr) == SETTINGS_EQ_BANDS) {
-
-    float gains[SETTINGS_EQ_BANDS];
-    for (int i = 0; i < SETTINGS_EQ_BANDS; i++) {
-      cJSON *item = cJSON_GetArrayItem(gains_arr, i);
-      gains[i] = cJSON_IsNumber(item) ? (float)item->valuedouble : 0.0f;
-      /* Clamp */
-      if (gains[i] > 15.0f) {
-        gains[i] = 15.0f;
-      }
-      if (gains[i] < -15.0f) {
-        gains[i] = -15.0f;
-      }
+  if (cJSON_IsBool(save) && cJSON_IsTrue(save)) {
+    err = eq_save_custom();
+  } else if (json_int_in_range(mode, 0, EQ_PRESET_COUNT - 1)) {
+    err = eq_set_preset((eq_preset_t)mode->valueint);
+  } else if (json_int_in_range(band, 0, EQ_BAND_COUNT - 1) &&
+             cJSON_IsNumber(gain)) {
+    float gain_db = (float)gain->valuedouble;
+    if (gain_db >= EQ_GAIN_MIN_DB && gain_db <= EQ_GAIN_MAX_DB) {
+      err = eq_set_band((size_t)band->valueint, gain_db);
     }
+  }
 
-    /* Emit event — listeners (settings + DAC) will handle it */
-    eq_event_data_t ev_data;
-    memcpy(ev_data.all_bands.gains_db, gains, sizeof(gains));
-    eq_events_emit(EQ_EVENT_ALL_BANDS_SET, &ev_data);
-
+  if (err == ESP_OK) {
     cJSON_AddBoolToObject(response, "success", true);
+    eq_add_state(response);
   } else {
     cJSON_AddBoolToObject(response, "success", false);
     cJSON_AddStringToObject(response, "error",
-                            "Expected 'gains' array with 15 values");
+                            "Expected mode, band/gain, or save_custom");
   }
 
   char *json_str = cJSON_Print(response);
@@ -1288,8 +1294,6 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
   cJSON_Delete(response);
   return ESP_OK;
 }
-
-#endif /* CONFIG_DAC_TAS58XX */
 
 esp_err_t web_server_start(uint16_t port) {
   if (s_server) {
@@ -1483,7 +1487,6 @@ esp_err_t web_server_start(uint16_t port) {
   windows_captive.uri = "/redirect";
   httpd_register_uri_handler(s_server, &windows_captive);
 
-#ifdef CONFIG_DAC_TAS58XX
   httpd_uri_t eq_page_uri = {
       .uri = "/eq", .method = HTTP_GET, .handler = eq_page_handler};
   httpd_register_uri_handler(s_server, &eq_page_uri);
@@ -1495,7 +1498,6 @@ esp_err_t web_server_start(uint16_t port) {
   httpd_uri_t eq_post_uri = {
       .uri = "/api/eq", .method = HTTP_POST, .handler = eq_post_handler};
   httpd_register_uri_handler(s_server, &eq_post_uri);
-#endif
 
   log_stream_register(s_server);
 

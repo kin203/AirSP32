@@ -11,6 +11,7 @@ set( SRC_FILES
     "audio/audio_timing.c"
     "audio/audio_crypto.c"
     "audio/audio_resample.c"
+    "audio/eq.c"
     "rtsp/rtsp_server.c"
     "rtsp/rtsp_conn.c"
     "rtsp/rtsp_message.c"

@@ -1,11 +1,13 @@
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "audio_stream.h"
 
 #include "audio_buffer.h"
 #include "audio_decoder.h"
 #include "audio_receiver_internal.h"
+#include "esp_log.h"
 
 extern const audio_stream_ops_t audio_stream_realtime_ops;
 extern const audio_stream_ops_t audio_stream_buffered_ops;
@@ -106,6 +108,14 @@ bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,
                            capacity_samples, &info);
   if (decoded_samples <= 0) {
     return false;
+  }
+  if (state->seek_epoch != 0 && state->post_seek_decoded_frames < 3) {
+    state->post_seek_decoded_frames++;
+    ESP_LOGI("audio_stream",
+             "Seek decoder output: epoch=%" PRIu32 " rtp=%" PRIu32
+             " decoded_frames=%d post_seek_decodes=%" PRIu32,
+             state->seek_epoch, timestamp, decoded_samples,
+             state->post_seek_decoded_frames);
   }
 
   int channels =

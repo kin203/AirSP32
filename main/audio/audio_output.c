@@ -3,6 +3,7 @@
 
 #include "audio_resample.h"
 #include "dac.h"
+#include "eq.h"
 #include "led.h"
 #include "settings.h"
 #include "driver/i2s_std.h"
@@ -14,6 +15,7 @@
 #include "freertos/task.h"
 #include "audio_receiver.h"
 #include <inttypes.h>
+#include <limits.h>
 #include <stdlib.h>
 #ifdef CONFIG_DAC_TAS58XX
 #include "dac_tas58xx.h"
@@ -77,6 +79,171 @@ static uint64_t output_submitted_frames;
 static uint64_t output_sent_frames;
 static uint64_t output_lost_frames;
 static uint32_t output_underruns;
+
+typedef struct {
+  uint64_t frames_submitted;
+  uint64_t bytes_submitted;
+  uint64_t bytes_accepted;
+  uint32_t write_errors;
+  uint64_t l_square_sum;
+  uint64_t r_square_sum;
+  uint64_t rms_frames;
+  int32_t peak_l;
+  int32_t peak_r;
+  int64_t last_log_us;
+  uint32_t seek_epoch;
+  uint32_t logged_seek_epoch;
+} audio_output_diag_t;
+
+static audio_output_diag_t output_diag;
+
+static uint32_t isqrt_u64(uint64_t x) {
+  uint64_t root = 0;
+  uint64_t bit = 1ULL << 62;
+
+  while (bit > x) {
+    bit >>= 2;
+  }
+  while (bit != 0) {
+    if (x >= root + bit) {
+      x -= root + bit;
+      root = (root >> 1) + bit;
+    } else {
+      root >>= 1;
+    }
+    bit >>= 2;
+  }
+  return (uint32_t)root;
+}
+
+static const char *slot_mode_name(i2s_slot_mode_t mode) {
+  switch (mode) {
+  case I2S_SLOT_MODE_MONO:
+    return "mono";
+  case I2S_SLOT_MODE_STEREO:
+    return "stereo";
+  default:
+    return "unknown";
+  }
+}
+
+static const char *slot_mask_name(i2s_std_slot_mask_t mask) {
+  switch (mask) {
+  case I2S_STD_SLOT_LEFT:
+    return "left";
+  case I2S_STD_SLOT_RIGHT:
+    return "right";
+  case I2S_STD_SLOT_BOTH:
+    return "both";
+  default:
+    return "unknown";
+  }
+}
+
+static void log_i2s_config(const i2s_std_config_t *std_cfg) {
+  ESP_LOGI(TAG, "I2S GPIO resolved: BCLK GPIO=%d, DOUT GPIO=%d, DIN GPIO=%d, "
+                "LRCK/WS GPIO=%d",
+           std_cfg->gpio_cfg.bclk, std_cfg->gpio_cfg.dout,
+           std_cfg->gpio_cfg.din, std_cfg->gpio_cfg.ws);
+  if (std_cfg->gpio_cfg.mclk >= 0) {
+    ESP_LOGI(TAG, "I2S GPIO resolved: MCLK GPIO=%d", std_cfg->gpio_cfg.mclk);
+  } else {
+    ESP_LOGI(TAG, "I2S GPIO resolved: MCLK disabled");
+  }
+#ifdef I2S_GND_PIN
+  ESP_LOGI(TAG, "I2S GPIO resolved: software-ground GPIO=%d", I2S_GND_PIN);
+#else
+  ESP_LOGI(TAG, "I2S GPIO resolved: software-ground disabled");
+#endif
+
+  ESP_LOGI(TAG,
+           "I2S format resolved: sample_rate=%" PRIu32
+           ", data_bit_width=%d, slot_bit_width=%d, slot_mode=%s(%d), "
+           "ws_width=%" PRIu32 ", bit_shift=%d, slot_mask=%s(0x%x)",
+           std_cfg->clk_cfg.sample_rate_hz, std_cfg->slot_cfg.data_bit_width,
+           std_cfg->slot_cfg.slot_bit_width,
+           slot_mode_name(std_cfg->slot_cfg.slot_mode),
+           std_cfg->slot_cfg.slot_mode, std_cfg->slot_cfg.ws_width,
+           std_cfg->slot_cfg.bit_shift,
+           slot_mask_name(std_cfg->slot_cfg.slot_mask),
+           std_cfg->slot_cfg.slot_mask);
+}
+
+static void diag_reset_window(int64_t now_us) {
+  output_diag.frames_submitted = 0;
+  output_diag.bytes_submitted = 0;
+  output_diag.bytes_accepted = 0;
+  output_diag.write_errors = 0;
+  output_diag.l_square_sum = 0;
+  output_diag.r_square_sum = 0;
+  output_diag.rms_frames = 0;
+  output_diag.peak_l = 0;
+  output_diag.peak_r = 0;
+  output_diag.last_log_us = now_us;
+}
+
+static void diag_record_i2s_write(const int16_t *pcm, size_t bytes_submitted,
+                                  size_t bytes_accepted, esp_err_t err) {
+  const size_t frames = bytes_submitted / (2U * sizeof(int16_t));
+  int64_t now_us = esp_timer_get_time();
+
+  if (output_diag.last_log_us == 0) {
+    diag_reset_window(now_us);
+  }
+
+  output_diag.frames_submitted += frames;
+  output_diag.bytes_submitted += bytes_submitted;
+  output_diag.bytes_accepted += bytes_accepted;
+  if (err != ESP_OK) {
+    output_diag.write_errors++;
+  }
+
+  if (output_diag.seek_epoch != output_diag.logged_seek_epoch &&
+      bytes_accepted > 0) {
+    output_diag.logged_seek_epoch = output_diag.seek_epoch;
+    ESP_LOGI(TAG,
+             "Seek output resumed: epoch=%" PRIu32 ", first_i2s_bytes=%zu, "
+             "submitted_bytes=%zu, err=%s",
+             output_diag.seek_epoch, bytes_accepted, bytes_submitted,
+             esp_err_to_name(err));
+  }
+
+  for (size_t i = 0; i < frames; i++) {
+    int32_t l = pcm[i * 2];
+    int32_t r = pcm[i * 2 + 1];
+    int32_t abs_l = l == INT16_MIN ? 32768 : abs(l);
+    int32_t abs_r = r == INT16_MIN ? 32768 : abs(r);
+
+    if (abs_l > output_diag.peak_l) {
+      output_diag.peak_l = abs_l;
+    }
+    if (abs_r > output_diag.peak_r) {
+      output_diag.peak_r = abs_r;
+    }
+    output_diag.l_square_sum += (uint64_t)(l * l);
+    output_diag.r_square_sum += (uint64_t)(r * r);
+  }
+  output_diag.rms_frames += frames;
+
+  if (now_us - output_diag.last_log_us >= 1000000) {
+    uint32_t rms_l = 0;
+    uint32_t rms_r = 0;
+    if (output_diag.rms_frames > 0) {
+      rms_l = isqrt_u64(output_diag.l_square_sum / output_diag.rms_frames);
+      rms_r = isqrt_u64(output_diag.r_square_sum / output_diag.rms_frames);
+    }
+
+    ESP_LOGD(TAG,
+             "I2S write diag: pcm_frames=%" PRIu64 ", pcm_bytes=%" PRIu64
+             ", accepted_bytes=%" PRIu64 ", write_errors=%" PRIu32
+             ", peak_l=%" PRId32 ", peak_r=%" PRId32 ", rms_l=%" PRIu32
+             ", rms_r=%" PRIu32,
+             output_diag.frames_submitted, output_diag.bytes_submitted,
+             output_diag.bytes_accepted, output_diag.write_errors,
+             output_diag.peak_l, output_diag.peak_r, rms_l, rms_r);
+    diag_reset_window(now_us);
+  }
+}
 
 static bool IRAM_ATTR audio_output_on_sent(i2s_chan_handle_t handle,
                                            i2s_event_data_t *event,
@@ -234,12 +401,16 @@ static void playback_task(void *arg) {
                                               MAX_RESAMPLE_FRAMES);
         play_buf = resample_buf;
       }
+      eq_process_stereo(play_buf, play_samples);
       apply_volume(play_buf, play_samples * 2);
       apply_channel_mode(play_buf, play_samples);
       led_audio_feed(play_buf, play_samples);
-      if (i2s_channel_write(tx_handle, play_buf,
-                            play_samples * 2 * sizeof(int16_t), &written,
-                            portMAX_DELAY) == ESP_OK) {
+      size_t write_bytes = play_samples * 2 * sizeof(int16_t);
+      esp_err_t err =
+          i2s_channel_write(tx_handle, play_buf, write_bytes, &written,
+                            portMAX_DELAY);
+      diag_record_i2s_write(play_buf, write_bytes, written, err);
+      if (err == ESP_OK) {
         __atomic_add_fetch(&output_submitted_frames,
                            (uint64_t)(written / (2U * sizeof(int16_t))),
                            __ATOMIC_RELAXED);
@@ -250,9 +421,11 @@ static void playback_task(void *arg) {
       // write (portMAX_DELAY) so the write itself paces the loop, instead of a
       // short timeout plus vTaskDelay(1) which produced jittery silence.
       led_audio_feed(silence, FRAME_SAMPLES);
-      if (i2s_channel_write(tx_handle, silence,
-                            (size_t)FRAME_SAMPLES * 2 * sizeof(int16_t),
-                            &written, portMAX_DELAY) == ESP_OK) {
+      size_t write_bytes = (size_t)FRAME_SAMPLES * 2 * sizeof(int16_t);
+      esp_err_t err = i2s_channel_write(tx_handle, silence, write_bytes,
+                                        &written, portMAX_DELAY);
+      diag_record_i2s_write(silence, write_bytes, written, err);
+      if (err == ESP_OK) {
         __atomic_add_fetch(&output_submitted_frames,
                            (uint64_t)(written / (2U * sizeof(int16_t))),
                            __ATOMIC_RELAXED);
@@ -311,6 +484,7 @@ esp_err_t audio_output_init(void) {
               .din = I2S_GPIO_UNUSED,
           },
   };
+  log_i2s_config(&std_cfg);
 #ifdef I2S_GND_PIN
   gpio_reset_pin(I2S_GND_PIN);
   gpio_set_direction(I2S_GND_PIN, GPIO_MODE_OUTPUT);
@@ -340,6 +514,7 @@ esp_err_t audio_output_init(void) {
 
   ESP_RETURN_ON_ERROR(i2s_channel_enable(tx_handle), TAG,
                       "channel enable failed");
+  ESP_RETURN_ON_ERROR(eq_init(), TAG, "EQ init failed");
   ESP_LOGI(TAG, "I2S initialized: Rate=%u, DMA_Desc=%d, DMA_Frame=%d",
            (unsigned int)OUTPUT_RATE, I2S_DMA_DESC_NUM, I2S_DMA_FRAME_NUM);
 
@@ -386,7 +561,9 @@ void audio_output_stop(void) {
 
 esp_err_t audio_output_write(const void *data, size_t bytes, TickType_t wait) {
   size_t written = 0;
-  return i2s_channel_write(tx_handle, data, bytes, &written, wait);
+  esp_err_t err = i2s_channel_write(tx_handle, data, bytes, &written, wait);
+  diag_record_i2s_write((const int16_t *)data, bytes, written, err);
+  return err;
 }
 
 void audio_output_set_sample_rate(uint32_t rate) {
@@ -404,6 +581,10 @@ void audio_output_set_sample_rate(uint32_t rate) {
 
 void audio_output_flush(void) {
   flush_requested = true;
+}
+
+void audio_output_mark_seek(uint32_t epoch) {
+  output_diag.seek_epoch = epoch;
 }
 
 void audio_output_set_source_rate(int rate) {
