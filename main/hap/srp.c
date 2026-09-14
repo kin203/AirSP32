@@ -8,6 +8,16 @@
 
 static const char *TAG = "srp";
 
+static void srpdbg_fp(const char *name, const uint8_t *data, size_t len) {
+    uint8_t hash[32];
+    crypto_hash_sha256(hash, data, len);
+    char fp_str[17];
+    for (int i = 0; i < 8; i++) {
+        sprintf(&fp_str[i * 2], "%02x", hash[i]);
+    }
+    ESP_LOGI(TAG, "SRPDBG receiver %s len=%d fp=%s", name, (int)len, fp_str);
+}
+
 // SRP-6a 3072-bit prime N (from RFC 5054)
 static const uint8_t srp_N[] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC9, 0x0F, 0xDA, 0xA2,
@@ -384,6 +394,29 @@ esp_err_t srp_verify_client(srp_session_t *session,
 
     compute_m1(expected_m1, h_Ng_xor, h_I, salt_ptr, salt_len, A_bytes, A_len,
                B_bytes, B_len, session->session_key, 64);
+
+    // --- INJECT DIAGNOSTICS HERE ---
+    {
+        uint8_t k_bytes[SRP_PRIME_BYTES], u_bytes[SRP_PRIME_BYTES], x_bytes[SRP_PRIME_BYTES];
+        size_t k_len = mpi_to_bytes_min(&k, k_bytes, sizeof(k_bytes));
+        size_t u_len = mpi_to_bytes_min(&u, u_bytes, sizeof(u_bytes));
+        size_t x_len = mpi_to_bytes_min(&x, x_bytes, sizeof(x_bytes));
+        
+        srpdbg_fp("salt", salt_ptr, salt_len);
+        srpdbg_fp("A", A_bytes, A_len);
+        srpdbg_fp("B", B_bytes, B_len);
+        srpdbg_fp("k", k_bytes, k_len);
+        srpdbg_fp("x", x_bytes, x_len);
+        srpdbg_fp("u", u_bytes, u_len);
+        srpdbg_fp("S", S_bytes, S_len);
+        srpdbg_fp("K", session->session_key, 64);
+        srpdbg_fp("expected_M1", expected_m1, 64);
+        srpdbg_fp("received_M1", client_proof, SRP_PROOF_BYTES);
+        srpdbg_fp("M1_g_input", &g_byte, 1);
+        srpdbg_fp("M1_xor_HN_Hg", h_Ng_xor, 64);
+        srpdbg_fp("M1_H_identity", h_I, 64);
+    }
+    // -------------------------------
   }
 
   // Verify client proof
