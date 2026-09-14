@@ -415,8 +415,31 @@ esp_err_t srp_verify_client(srp_session_t *session,
         srpdbg_fp("M1_g_input", &g_byte, 1);
         srpdbg_fp("M1_xor_HN_Hg", h_Ng_xor, 64);
         srpdbg_fp("M1_H_identity", h_I, 64);
+        
+        // Exponent/Intermediate diagnostics
+        uint8_t v_bytes[SRP_PRIME_BYTES], vu_bytes[SRP_PRIME_BYTES], avu_bytes[SRP_PRIME_BYTES], b_recomp_bytes[SRP_PRIME_BYTES];
+        mpi_to_bytes_padded(&v, v_bytes, sizeof(v_bytes));
+        mpi_to_bytes_padded(&tmp, vu_bytes, sizeof(vu_bytes));
+        mpi_to_bytes_padded(&tmp2, avu_bytes, sizeof(avu_bytes));
+        
+        {
+            mbedtls_mpi B_recomp, g_b, k_v;
+            mbedtls_mpi_init(&B_recomp); mbedtls_mpi_init(&g_b); mbedtls_mpi_init(&k_v);
+            mbedtls_mpi_exp_mod(&g_b, &g, &b, &N, NULL);
+            mbedtls_mpi_mul_mpi(&k_v, &k, &v);
+            mbedtls_mpi_add_mpi(&B_recomp, &k_v, &g_b);
+            mbedtls_mpi_mod_mpi(&B_recomp, &B_recomp, &N);
+            mpi_to_bytes_padded(&B_recomp, b_recomp_bytes, sizeof(b_recomp_bytes));
+            mbedtls_mpi_free(&B_recomp); mbedtls_mpi_free(&g_b); mbedtls_mpi_free(&k_v);
+        }
+        
+        srpdbg_fp("v", v_bytes, sizeof(v_bytes));
+        srpdbg_fp("v_pow_u", vu_bytes, sizeof(vu_bytes));
+        srpdbg_fp("A_mul_vu", avu_bytes, sizeof(avu_bytes));
+        srpdbg_fp("B_recomputed", b_recomp_bytes, sizeof(b_recomp_bytes));
     }
     // -------------------------------
+
   }
 
   // Verify client proof
