@@ -190,6 +190,11 @@ esp_err_t srp_start(srp_session_t *session, const char *username,
   if (mbedtls_mpi_exp_mod(&v, &g, &x, &N, NULL) != 0) {
     goto cleanup;
   }
+  {
+    uint8_t v_buf[SRP_PRIME_BYTES];
+    mpi_to_bytes_padded(&v, v_buf, sizeof(v_buf));
+    srpdbg_fp("v_M2", v_buf, sizeof(v_buf));
+  }
 
   // Generate random b (server secret)
   {
@@ -213,12 +218,23 @@ esp_err_t srp_start(srp_session_t *session, const char *username,
   if (mbedtls_mpi_mul_mpi(&tmp2, &k, &v) != 0) {
     goto cleanup;
   }
+  {
+    uint8_t kmv[SRP_PRIME_BYTES];
+    mpi_to_bytes_padded(&tmp2, kmv, sizeof(kmv));
+    srpdbg_fp("k_mul_v_M2", kmv, sizeof(kmv));
+  }
   if (mbedtls_mpi_add_mpi(&B, &tmp2, &tmp) != 0) {
     goto cleanup;
   }
   mbedtls_mpi_mod_mpi(&B, &B, &N);
+  {
+    uint8_t bbs[SRP_PRIME_BYTES];
+    mpi_to_bytes_padded(&B, bbs, sizeof(bbs));
+    srpdbg_fp("B_before_serialize", bbs, sizeof(bbs));
+  }
 
   mpi_to_bytes_padded(&B, session->server_public_key, SRP_PRIME_BYTES);
+  srpdbg_fp("B_serialized", session->server_public_key, SRP_PRIME_BYTES);
   session->state = 1;
   ret = 0;
 
@@ -347,6 +363,11 @@ esp_err_t srp_verify_client(srp_session_t *session,
   // v = g^x mod N
   if (mbedtls_mpi_exp_mod(&v, &g, &x, &N, NULL) != 0) {
     goto cleanup;
+  }
+  {
+    uint8_t v_buf[SRP_PRIME_BYTES];
+    mpi_to_bytes_padded(&v, v_buf, sizeof(v_buf));
+    srpdbg_fp("v_M3", v_buf, sizeof(v_buf));
   }
 
   // S = (A * v^u)^b mod N
