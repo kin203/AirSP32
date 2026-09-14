@@ -198,11 +198,17 @@ esp_err_t srp_start(srp_session_t *session, const char *username,
     mbedtls_mpi_read_binary(&b, b_bytes, sizeof(b_bytes));
     mbedtls_mpi_mod_mpi(&b, &b, &N);
     mpi_to_bytes_padded(&b, session->server_secret, SRP_PRIME_BYTES);
+    srpdbg_fp("b_at_M2", session->server_secret, SRP_PRIME_BYTES);
   }
 
   // B = (k*v + g^b) mod N
   if (mbedtls_mpi_exp_mod(&tmp, &g, &b, &N, NULL) != 0) {
     goto cleanup;
+  }
+  {
+    uint8_t gpb[SRP_PRIME_BYTES];
+    mpi_to_bytes_padded(&tmp, gpb, sizeof(gpb));
+    srpdbg_fp("g_pow_b", gpb, sizeof(gpb));
   }
   if (mbedtls_mpi_mul_mpi(&tmp2, &k, &v) != 0) {
     goto cleanup;
@@ -283,6 +289,7 @@ esp_err_t srp_verify_client(srp_session_t *session,
   mbedtls_mpi_read_binary(&A, session->client_public_key, SRP_PRIME_BYTES);
   mbedtls_mpi_read_binary(&B, session->server_public_key, SRP_PRIME_BYTES);
   mbedtls_mpi_read_binary(&b, session->server_secret, SRP_PRIME_BYTES);
+  srpdbg_fp("b_at_M3", session->server_secret, SRP_PRIME_BYTES);
 
   // Check A != 0 and A % N != 0
   if (mbedtls_mpi_cmp_int(&A, 0) == 0) {
@@ -346,10 +353,20 @@ esp_err_t srp_verify_client(srp_session_t *session,
   if (mbedtls_mpi_exp_mod(&tmp, &v, &u, &N, NULL) != 0) {
     goto cleanup;
   }
+  {
+    uint8_t vpu[SRP_PRIME_BYTES];
+    mpi_to_bytes_padded(&tmp, vpu, sizeof(vpu));
+    srpdbg_fp("v_pow_u", vpu, sizeof(vpu));
+  }
   if (mbedtls_mpi_mul_mpi(&tmp2, &A, &tmp) != 0) {
     goto cleanup;
   }
   mbedtls_mpi_mod_mpi(&tmp2, &tmp2, &N);
+  {
+    uint8_t avu[SRP_PRIME_BYTES];
+    mpi_to_bytes_padded(&tmp2, avu, sizeof(avu));
+    srpdbg_fp("A_mul_vu", avu, sizeof(avu));
+  }
   if (mbedtls_mpi_exp_mod(&S, &tmp2, &b, &N, NULL) != 0) {
     goto cleanup;
   }
@@ -395,13 +412,13 @@ esp_err_t srp_verify_client(srp_session_t *session,
     compute_m1(expected_m1, h_Ng_xor, h_I, salt_ptr, salt_len, A_bytes, A_len,
                B_bytes, B_len, session->session_key, 64);
 
-    // --- INJECT DIAGNOSTICS HERE ---
+    // --- Lightweight diagnostics (observation only) ---
     {
         uint8_t k_bytes[SRP_PRIME_BYTES], u_bytes[SRP_PRIME_BYTES], x_bytes[SRP_PRIME_BYTES];
         size_t k_len = mpi_to_bytes_min(&k, k_bytes, sizeof(k_bytes));
         size_t u_len = mpi_to_bytes_min(&u, u_bytes, sizeof(u_bytes));
         size_t x_len = mpi_to_bytes_min(&x, x_bytes, sizeof(x_bytes));
-        
+
         srpdbg_fp("salt", salt_ptr, salt_len);
         srpdbg_fp("A", A_bytes, A_len);
         srpdbg_fp("B", B_bytes, B_len);
@@ -416,9 +433,6 @@ esp_err_t srp_verify_client(srp_session_t *session,
         srpdbg_fp("M1_xor_HN_Hg", h_Ng_xor, 64);
         srpdbg_fp("M1_H_identity", h_I, 64);
     }
-    // -------------------------------
-
-
   }
 
   // Verify client proof
