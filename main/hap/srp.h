@@ -76,6 +76,8 @@ const uint8_t *srp_get_public_key(srp_session_t *session, size_t *len);
  * @return ESP_OK if verification succeeds
  */
 esp_err_t srp_verify_client(srp_session_t *session,
+                            const char *username,
+                            const char *password,
                             const uint8_t *client_public_key,
                             size_t client_pk_len, const uint8_t *client_proof,
                             size_t proof_len);

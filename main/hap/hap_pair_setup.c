@@ -38,9 +38,15 @@ esp_err_t hap_pair_setup_m1(hap_session_t *session, const uint8_t *input,
   }
 
   bool transient = false;
-  if (flags && flags_len == 1) {
-    transient = (flags[0] & 0x10) != 0;
+  uint32_t flags_value = 0;
+  if (flags && flags_len > 0) {
+    size_t n = flags_len > 4 ? 4 : flags_len;
+    for (size_t i = 0; i < n; i++) {
+        flags_value |= ((uint32_t)flags[i]) << (8 * i);
+    }
+    transient = (flags_value & 0x10u) != 0;
   }
+  ESP_LOGI(TAG, "PairSetup M1 flags_len=%d flags_value=0x%08X transient=%s", (int)flags_len, (unsigned int)flags_value, transient ? "true" : "false");
   session->pair_setup_transient = transient;
 
   if (session->srp) {
@@ -107,7 +113,9 @@ esp_err_t hap_pair_setup_m3(hap_session_t *session, const uint8_t *input,
     return ESP_ERR_INVALID_ARG;
   }
 
-  esp_err_t err = srp_verify_client(session->srp, client_pk, pk_len,
+  const char *password = session->pair_setup_transient ? "3939" : "0000";
+  esp_err_t err = srp_verify_client(session->srp, "Pair-Setup", password,
+                                    client_pk, pk_len,
                                     client_proof, proof_len);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Client verification failed");

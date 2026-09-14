@@ -219,9 +219,9 @@ esp_err_t srp_start(srp_session_t *session, const char *username,
     goto cleanup;
   }
   {
-    uint8_t kmv[SRP_PRIME_BYTES];
-    mpi_to_bytes_padded(&tmp2, kmv, sizeof(kmv));
-    srpdbg_fp("k_mul_v_M2", kmv, sizeof(kmv));
+    uint8_t kmv[512]; // tmp2 (k*v) can be up to ~448 bytes
+    size_t kmv_len = mpi_to_bytes_min(&tmp2, kmv, sizeof(kmv));
+    srpdbg_fp("k_mul_v_M2", kmv, kmv_len);
   }
   if (mbedtls_mpi_add_mpi(&B, &tmp2, &tmp) != 0) {
     goto cleanup;
@@ -267,6 +267,8 @@ const uint8_t *srp_get_public_key(srp_session_t *session, size_t *len) {
 }
 
 esp_err_t srp_verify_client(srp_session_t *session,
+                            const char *username,
+                            const char *password,
                             const uint8_t *client_public_key,
                             size_t client_pk_len, const uint8_t *client_proof,
                             size_t proof_len) {
@@ -341,14 +343,14 @@ esp_err_t srp_verify_client(srp_session_t *session,
     mbedtls_mpi_mod_mpi(&k, &k, &N);
   }
 
-  // Recompute x = H(s || H(I || ":" || P)) for "Pair-Setup:3939"
+  // Recompute x = H(s || H(I || ":" || P))
   {
     uint8_t inner_hash[64];
     crypto_hash_sha512_state state;
     crypto_hash_sha512_init(&state);
-    crypto_hash_sha512_update(&state, (const uint8_t *)"Pair-Setup", 10);
+    crypto_hash_sha512_update(&state, (const uint8_t *)username, strlen(username));
     crypto_hash_sha512_update(&state, (const uint8_t *)":", 1);
-    crypto_hash_sha512_update(&state, (const uint8_t *)"3939", 4);
+    crypto_hash_sha512_update(&state, (const uint8_t *)password, strlen(password));
     crypto_hash_sha512_final(&state, inner_hash);
 
     uint8_t x_hash[64];
